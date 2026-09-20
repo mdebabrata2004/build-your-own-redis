@@ -1,0 +1,7 @@
+target/
+.history/
+*.data
+*.data.corrupt
+.idea/
+.vscode/
+*.iml
