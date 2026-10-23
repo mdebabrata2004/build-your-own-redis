@@ -1,29 +1,45 @@
 package com.miniredis.command;
 
+import com.miniredis.security.ApiKeyService;
+import com.miniredis.security.SecurityContext;
+import com.miniredis.storage.EmbeddedStorageEngine;
+import com.miniredis.storage.ScanResult;
+import com.miniredis.storage.StorageEngine;
 import com.miniredis.store.DataStore;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.Set;
+import java.util.Objects;
+import java.util.Optional;
 
 /**
- * Translates Redis commands into DataStore operations and returns RESP replies.
- *
- * Still a single class (registry split comes next phase).
- * Compatible with hardened DataStore (SCAN, PERSIST, multi-del, etc.).
+ * Translates Redis commands into StorageEngine operations and returns RESP replies.
+ * Supports multi-tenant AUTH, String, Key, Counter, and Server commands.
  */
 public final class CommandHandler {
 
-    private final DataStore store;
+    private final StorageEngine store;
+    private final ApiKeyService apiKeyService;
+
+    public CommandHandler(StorageEngine store) {
+        this(store, null);
+    }
+
+    public CommandHandler(StorageEngine store, ApiKeyService apiKeyService) {
+        this.store = Objects.requireNonNull(store, "StorageEngine cannot be null");
+        this.apiKeyService = apiKeyService;
+    }
 
     public CommandHandler(DataStore store) {
-        if (store == null) {
-            throw new IllegalArgumentException("DataStore cannot be null");
-        }
-        this.store = store;
+        this(new EmbeddedStorageEngine(store), null);
+    }
+
+    public StorageEngine getStore() {
+        return store;
     }
 
     /**
@@ -40,10 +56,11 @@ public final class CommandHandler {
         try {
             return switch (cmd) {
 
-                // Connection
+                // Connection & Auth
                 case "PING"     -> handlePing(args);
                 case "QUIT"     -> handleQuit();
                 case "ECHO"     -> handleEcho(args);
+                case "AUTH"     -> handleAuth(args);
 
                 // String
                 case "SET"      -> handleSet(args);
@@ -89,7 +106,7 @@ public final class CommandHandler {
     }
 
     // ──────────────────────────────────────────────────────────────
-    // Connection
+    // Connection & Auth
     // ──────────────────────────────────────────────────────────────
 
     private String handlePing(List<String> args) {
@@ -107,6 +124,22 @@ public final class CommandHandler {
             return error("wrong number of arguments for 'echo' command");
         }
         return bulk(args.get(1));
+    }
+
+    private String handleAuth(List<String> args) {
+        if (args.size() < 2 || args.size() > 3) {
+            return error("wrong number of arguments for 'auth' command");
+        }
+        String password = args.size() == 2 ? args.get(1) : args.get(2);
+        if (apiKeyService == null) {
+            return simple("OK");
+        }
+        Optional<SecurityContext> ctx = apiKeyService.authenticate(password);
+        if (ctx.isPresent()) {
+            return simple("OK");
+        } else {
+            return error("WRONGPASS invalid username-password pair or user is disabled.");
+        }
     }
 
     // ──────────────────────────────────────────────────────────────
@@ -136,7 +169,7 @@ public final class CommandHandler {
                 case "PX" -> {
                     if (i + 1 >= args.size()) return error("syntax error");
                     long ms = parsePositiveLong(args.get(++i));
-                    ttlSeconds = Math.max(1, (ms + 999) / 1000); // ceil to seconds
+                    ttlSeconds = Math.max(1, (ms + 999) / 1000);
                 }
                 default -> {
                     return error("syntax error");
@@ -154,29 +187,27 @@ public final class CommandHandler {
         if (args.size() != 2) {
             return error("wrong number of arguments for 'get' command");
         }
-        String value = store.get(args.get(1));
-        return value == null ? nullBulk() : bulk(value);
+        return bulk(store.get(args.get(1)));
     }
 
     private String handleMGet(List<String> args) {
         if (args.size() < 2) {
             return error("wrong number of arguments for 'mget' command");
         }
-        List<String> values = new ArrayList<>(args.size() - 1);
-        for (int i = 1; i < args.size(); i++) {
-            values.add(store.get(args.get(i))); // null allowed → null bulk
-        }
+        List<String> keys = args.subList(1, args.size());
+        List<String> values = store.mget(keys);
         return arrayOfBulksAllowNull(values);
     }
 
     private String handleMSet(List<String> args) {
-        // MSET key value [key value ...]
         if (args.size() < 3 || (args.size() - 1) % 2 != 0) {
             return error("wrong number of arguments for 'mset' command");
         }
+        Map<String, String> entries = new HashMap<>();
         for (int i = 1; i < args.size(); i += 2) {
-            store.set(args.get(i), args.get(i + 1));
+            entries.put(args.get(i), args.get(i + 1));
         }
+        store.mset(entries);
         return simple("OK");
     }
 
@@ -184,23 +215,26 @@ public final class CommandHandler {
         if (args.size() != 3) {
             return error("wrong number of arguments for 'getset' command");
         }
-        String old = store.getSet(args.get(1), args.get(2));
-        return old == null ? nullBulk() : bulk(old);
+        String key = args.get(1);
+        String newVal = args.get(2);
+        String oldVal = store.get(key);
+        store.set(key, newVal);
+        return bulk(oldVal);
     }
 
     private String handleAppend(List<String> args) {
         if (args.size() != 3) {
             return error("wrong number of arguments for 'append' command");
         }
-        return integer(store.append(args.get(1), args.get(2)));
+        long newLen = store.append(args.get(1), args.get(2));
+        return integer(newLen);
     }
 
     private String handleStrLen(List<String> args) {
         if (args.size() != 2) {
             return error("wrong number of arguments for 'strlen' command");
         }
-        String value = store.get(args.get(1));
-        return integer(value == null ? 0 : value.length());
+        return integer(store.strLen(args.get(1)));
     }
 
     // ──────────────────────────────────────────────────────────────
@@ -211,11 +245,8 @@ public final class CommandHandler {
         if (args.size() < 2) {
             return error("wrong number of arguments for 'del' command");
         }
-        int deleted = 0;
-        for (int i = 1; i < args.size(); i++) {
-            if (store.delete(args.get(i))) deleted++;
-        }
-        return integer(deleted);
+        List<String> keys = args.subList(1, args.size());
+        return integer(store.deleteMulti(keys));
     }
 
     private String handleExists(List<String> args) {
@@ -268,7 +299,6 @@ public final class CommandHandler {
         if (!store.exists(args.get(1))) {
             return simple("none");
         }
-        // Only string type today
         return simple("string");
     }
 
@@ -276,25 +306,16 @@ public final class CommandHandler {
         if (args.size() != 2) {
             return error("wrong number of arguments for 'keys' command");
         }
-        Set<String> keys = store.keys(args.get(1));
+        List<String> keys = store.keys(args.get(1));
         return arrayOfBulks(keys);
     }
 
-    /**
-     * SCAN cursor [MATCH pattern] [COUNT count]
-     */
     private String handleScan(List<String> args) {
         if (args.size() < 2) {
             return error("wrong number of arguments for 'scan' command");
         }
 
-        long cursor;
-        try {
-            cursor = Long.parseLong(args.get(1));
-        } catch (NumberFormatException e) {
-            return error("invalid cursor");
-        }
-
+        String cursor = args.get(1);
         String pattern = "*";
         int count = 10;
 
@@ -311,23 +332,22 @@ public final class CommandHandler {
             }
         }
 
-        DataStore.ScanResult result = store.scan(cursor, pattern, count);
+        ScanResult result = store.scan(cursor, pattern, count);
 
-        // RESP: *2\r\n $cursor \r\n *N keys...
         StringBuilder sb = new StringBuilder();
         sb.append("*2\r\n");
-        sb.append(bulk(Long.toString(result.nextCursor)));
-        sb.append(arrayOfBulks(result.keys));
+        sb.append(bulk(result.nextCursor()));
+        sb.append(arrayOfBulks(result.keys()));
         return sb.toString();
     }
 
     private String handleFlush() {
-        store.flush();
+        store.flushDb();
         return simple("OK");
     }
 
     private String handleDbSize() {
-        return integer(store.size());
+        return integer(store.dbSize());
     }
 
     // ──────────────────────────────────────────────────────────────
@@ -367,23 +387,21 @@ public final class CommandHandler {
     // ──────────────────────────────────────────────────────────────
 
     private String handleInfo(List<String> args) {
-        // INFO [section] — we ignore section for now and return all
         Map<String, Object> info = store.info();
         StringBuilder sb = new StringBuilder(256);
         sb.append("# Server\r\n");
-        sb.append("redis_version:miniredis-1.1\r\n");
-        sb.append("executable:miniredis\r\n");
+        sb.append("redis_version:localdata-redis-1.0\r\n");
+        sb.append("platform:LocalData Managed Redis\r\n");
         sb.append("\r\n# Keyspace\r\n");
-        sb.append("db0:keys=").append(info.get("keys")).append("\r\n");
+        sb.append("db0:keys=").append(info.getOrDefault("keys", store.dbSize())).append("\r\n");
         sb.append("\r\n# Stats\r\n");
         info.forEach((k, v) -> sb.append(k).append(':').append(v).append("\r\n"));
         return bulk(sb.toString());
     }
 
     private String handleCommand(List<String> args) {
-        // COMMAND with no args → list names (minimal)
         return arrayOfBulks(List.of(
-                "ping", "quit", "echo",
+                "ping", "quit", "echo", "auth",
                 "set", "get", "mget", "mset", "getset", "append", "strlen",
                 "del", "exists", "expire", "persist", "ttl", "pttl", "type",
                 "keys", "scan", "flushdb", "dbsize",
@@ -398,8 +416,6 @@ public final class CommandHandler {
     }
 
     private String handleBgSave() {
-        // Our background saver is already periodic; trigger one now via save in caller thread
-        // Real BGSAVE would fork; we just run save (acceptable for mini)
         store.save();
         return simple("Background saving started");
     }
@@ -440,7 +456,6 @@ public final class CommandHandler {
         return "*" + count + "\r\n" + body;
     }
 
-    /** Like arrayOfBulks but null elements become null bulk. */
     private static String arrayOfBulksAllowNull(List<String> items) {
         StringBuilder body = new StringBuilder();
         for (String item : items) {

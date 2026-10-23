@@ -5,3 +5,9 @@ target/
 .idea/
 .vscode/
 *.iml
+data/
+*.db
+*.db-wal
+*.db-shm
+sdk/typescript/node_modules/
+sdk/typescript/dist/

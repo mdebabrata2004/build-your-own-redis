@@ -1,0 +1,26 @@
+{
+  "name": "@localdata/client",
+  "version": "1.0.0",
+  "description": "Official TypeScript & JavaScript client for the LocalData Managed Redis Data Platform",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "node test-live.js"
+  },
+  "keywords": [
+    "redis",
+    "cache",
+    "kv",
+    "data-platform",
+    "rest",
+    "multi-tenant",
+    "upstash-compatible"
+  ],
+  "author": "LocalData Team",
+  "license": "Apache-2.0",
+  "devDependencies": {
+    "typescript": "^5.6.3",
+    "@types/node": "^22.7.5"
+  }
+}

@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  localdata-platform:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: localdata-redis-platform
+    restart: unless-stopped
+    ports:
+      - "8080:8080"   # REST API & Developer Dashboard
+      - "6379:6379"   # Redis Wire Protocol (RESP2)
+    environment:
+      - HTTP_PORT=8080
+      - REDIS_PORT=6379
+      - BIND_ADDRESS=0.0.0.0
+      - DATA_DIR=/app/data
+      - AUTH_PEPPER=localdata-custom-prod-pepper-change-in-production
+      - DEFAULT_RATE_LIMIT_RPS=100
+      - DEFAULT_RATE_LIMIT_BURST=200
+      - MAX_PAYLOAD_SIZE_BYTES=524288
+      - REQUIRE_TCP_AUTH=true
+    volumes:
+      - localdata-storage:/app/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+volumes:
+  localdata-storage:
+    driver: local

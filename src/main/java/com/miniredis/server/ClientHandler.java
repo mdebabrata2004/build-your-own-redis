@@ -1,6 +1,11 @@
 package com.miniredis.server;
 
 import com.miniredis.command.CommandHandler;
+import com.miniredis.security.ApiKeyService;
+import com.miniredis.security.SecurityContext;
+import com.miniredis.storage.EmbeddedStorageEngine;
+import com.miniredis.storage.StorageEngine;
+import com.miniredis.storage.TenantStorageEngine;
 
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
@@ -15,29 +20,36 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.Optional;
 
 /**
- * Single-client RESP connection handler.
- *
- * Hardening:
- *  - QUIT closes the connection after reply
- *  - Protocol errors return -ERR when possible instead of silent drop
- *  - Stricter size limits
- *  - Cleaner disconnect paths
+ * Single-client RESP connection handler supporting multi-tenant AUTH routing.
  */
 public final class ClientHandler implements Runnable {
 
     private static final int MAX_BULK_LENGTH   = 512 * 1024;  // 512 KB
     private static final int MAX_ARRAY_LENGTH  = 1024;
     private static final int MAX_INLINE_LENGTH = 64 * 1024;
-    private static final int MAX_NESTING       = 1;           // commands are flat arrays only
 
     private final Socket client;
-    private final CommandHandler handler;
+    private final StorageEngine rootEngine;
+    private final ApiKeyService apiKeyService;
+    private final boolean requireAuth;
+
+    private CommandHandler sessionHandler;
+    private SecurityContext sessionContext;
 
     public ClientHandler(Socket client, CommandHandler handler) {
+        this(client, handler.getStore(), null, false);
+    }
+
+    public ClientHandler(Socket client, StorageEngine rootEngine, ApiKeyService apiKeyService, boolean requireAuth) {
         this.client = client;
-        this.handler = handler;
+        this.rootEngine = rootEngine;
+        this.apiKeyService = apiKeyService;
+        this.requireAuth = requireAuth;
+        this.sessionHandler = new CommandHandler(rootEngine, apiKeyService);
+        this.sessionContext = null;
     }
 
     @Override
@@ -59,7 +71,6 @@ public final class ClientHandler implements Runnable {
                 try {
                     command = readCommand(in);
                 } catch (ProtocolException pe) {
-                    // Recoverable protocol error → reply and continue
                     writeResponse(out, error(pe.getMessage()));
                     out.flush();
                     continue;
@@ -72,15 +83,35 @@ public final class ClientHandler implements Runnable {
                     continue;
                 }
 
-                String name = command.get(0);
+                String name = command.get(0).toUpperCase(Locale.ROOT);
                 log("[" + remote + "] " + name + (command.size() > 1 ? " ..." : ""));
 
-                String response = handler.handle(command);
+                // Handle multi-tenant AUTH command specifically
+                if (name.equals("AUTH")) {
+                    handleAuthCommand(command, out);
+                    out.flush();
+                    continue;
+                }
+
+                // Enforce AUTH if configured
+                if (requireAuth && sessionContext == null) {
+                    if (name.equals("PING") || name.equals("QUIT") || name.equals("COMMAND")) {
+                        String resp = sessionHandler.handle(command);
+                        writeResponse(out, resp);
+                        out.flush();
+                        if (name.equals("QUIT")) running = false;
+                        continue;
+                    }
+                    writeResponse(out, "-NOAUTH Authentication required.\r\n");
+                    out.flush();
+                    continue;
+                }
+
+                String response = sessionHandler.handle(command);
                 writeResponse(out, response);
                 out.flush();
 
-                // QUIT → close after successful reply
-                if (name.equalsIgnoreCase("QUIT")) {
+                if (name.equals("QUIT")) {
                     running = false;
                 }
             }
@@ -98,13 +129,36 @@ public final class ClientHandler implements Runnable {
         }
     }
 
+    private void handleAuthCommand(List<String> command, OutputStream out) throws IOException {
+        if (command.size() < 2 || command.size() > 3) {
+            writeResponse(out, error("wrong number of arguments for 'auth' command"));
+            return;
+        }
+
+        String password = command.size() == 2 ? command.get(1) : command.get(2);
+
+        if (apiKeyService == null) {
+            writeResponse(out, "+OK\r\n");
+            return;
+        }
+
+        Optional<SecurityContext> maybeCtx = apiKeyService.authenticate(password);
+        if (maybeCtx.isPresent()) {
+            this.sessionContext = maybeCtx.get();
+            // Bind this client session to the tenant's isolated engine!
+            TenantStorageEngine tenantStore = new TenantStorageEngine(rootEngine, sessionContext.projectId(), 0);
+            this.sessionHandler = new CommandHandler(tenantStore, apiKeyService);
+            writeResponse(out, "+OK\r\n");
+            log("Client authenticated for project: " + sessionContext.projectId());
+        } else {
+            writeResponse(out, "-WRONGPASS invalid username-password pair or user is disabled.\r\n");
+        }
+    }
+
     // ──────────────────────────────────────────────────────────────
     // RESP Reader
     // ──────────────────────────────────────────────────────────────
 
-    /**
-     * @return command args, empty list for blank inline, null on EOF
-     */
     private List<String> readCommand(InputStream in) throws IOException {
         int first = in.read();
         if (first == -1) {
@@ -115,9 +169,7 @@ public final class ClientHandler implements Runnable {
             return readArray(in);
         }
 
-        // Allow inline for telnet / simple tests
         if (first == '+' || first == '-' || first == ':' || first == '$') {
-            // Client sent a response type as request — invalid
             throw new ProtocolException("Protocol error: invalid request type");
         }
 
@@ -149,124 +201,112 @@ public final class ClientHandler implements Runnable {
             throw new ProtocolException("Protocol error: expected '$', got '" + (char) type + "'");
         }
 
-        long len = readLong(in);
-        if (len == -1) {
-            return null;
-        }
-        if (len < 0) {
+        long length = readLong(in);
+        if (length < -1) {
             throw new ProtocolException("Protocol error: invalid bulk length");
         }
-        if (len > MAX_BULK_LENGTH) {
-            throw new ProtocolException("Protocol error: bulk length too large");
+        if (length > MAX_BULK_LENGTH) {
+            throw new ProtocolException("Protocol error: bulk string length exceeds limit");
+        }
+        if (length == -1) {
+            return null;
         }
 
-        byte[] buf = new byte[(int) len];
-        int offset = 0;
-        while (offset < len) {
-            int n = in.read(buf, offset, (int) (len - offset));
-            if (n == -1) {
-                throw new EOFException("Unexpected EOF in bulk");
-            }
-            offset += n;
+        byte[] bytes = in.readNBytes((int) length);
+        if (bytes.length != length) {
+            throw new EOFException("Unexpected EOF while reading bulk string");
         }
-        expectCrlf(in);
-        return new String(buf, StandardCharsets.UTF_8);
+
+        expectCrLf(in);
+        return new String(bytes, StandardCharsets.UTF_8);
     }
 
     private List<String> readInline(InputStream in, char first) throws IOException {
-        StringBuilder sb = new StringBuilder(64);
+        StringBuilder sb = new StringBuilder();
         sb.append(first);
 
         int b;
         while ((b = in.read()) != -1) {
-            if (b == '\n') break;
-            if (b != '\r') sb.append((char) b);
-            if (sb.length() > MAX_INLINE_LENGTH) {
-                throw new ProtocolException("Protocol error: inline request too long");
+            if (b == '\r') {
+                int next = in.read();
+                if (next == '\n') break;
+                if (next != -1) sb.append('\r').append((char) next);
+            } else if (b == '\n') {
+                break;
+            } else {
+                if (sb.length() >= MAX_INLINE_LENGTH) {
+                    throw new ProtocolException("Protocol error: inline command too long");
+                }
+                sb.append((char) b);
             }
         }
 
         String line = sb.toString().trim();
-        if (line.isEmpty()) {
-            return List.of();
-        }
+        if (line.isEmpty()) return List.of();
 
-        // Simple whitespace split (telnet only; real clients use RESP arrays)
-        String[] parts = line.split("\\s+");
-        List<String> args = new ArrayList<>(parts.length);
-        for (String p : parts) {
-            if (!p.isEmpty()) args.add(p);
+        List<String> tokens = new ArrayList<>();
+        StringBuilder current = new StringBuilder();
+        boolean inQuotes = false;
+
+        for (int i = 0; i < line.length(); i++) {
+            char c = line.charAt(i);
+            if (c == '"') {
+                inQuotes = !inQuotes;
+            } else if (Character.isWhitespace(c) && !inQuotes) {
+                if (!current.isEmpty()) {
+                    tokens.add(current.toString());
+                    current.setLength(0);
+                }
+            } else {
+                current.append(c);
+            }
         }
-        return args;
+        if (!current.isEmpty()) tokens.add(current.toString());
+        return tokens;
     }
 
     private long readLong(InputStream in) throws IOException {
-        StringBuilder sb = new StringBuilder(20);
+        StringBuilder sb = new StringBuilder();
         int b;
         while ((b = in.read()) != -1) {
             if (b == '\r') {
-                int n = in.read();
-                if (n != '\n') {
-                    throw new ProtocolException("Protocol error: expected LF after CR");
-                }
+                int next = in.read();
+                if (next != '\n') throw new ProtocolException("Protocol error: expected '\\n' after '\\r'");
                 break;
             }
-            if (b == '\n') {
-                break; // tolerate lone LF
-            }
+            if (b == '\n') break;
             sb.append((char) b);
-            if (sb.length() > 20) {
-                throw new ProtocolException("Protocol error: number too long");
-            }
-        }
-        if (sb.isEmpty()) {
-            throw new ProtocolException("Protocol error: empty number");
         }
         try {
-            return Long.parseLong(sb.toString());
+            return Long.parseLong(sb.toString().trim());
         } catch (NumberFormatException e) {
-            throw new ProtocolException("Protocol error: invalid number");
+            throw new ProtocolException("Protocol error: invalid integer '" + sb + "'");
         }
     }
 
-    private void expectCrlf(InputStream in) throws IOException {
-        int c1 = in.read();
-        int c2 = in.read();
-        if (c1 == -1 || c2 == -1) {
-            throw new EOFException();
-        }
-        if (c1 != '\r' || c2 != '\n') {
+    private void expectCrLf(InputStream in) throws IOException {
+        int r = in.read();
+        int n = in.read();
+        if (r != '\r' || n != '\n') {
             throw new ProtocolException("Protocol error: expected CRLF");
         }
     }
 
-    // ──────────────────────────────────────────────────────────────
-    // Writer
-    // ──────────────────────────────────────────────────────────────
-
-    private void writeResponse(OutputStream out, String resp) throws IOException {
-        if (resp == null || resp.isEmpty()) {
-            out.write("$-1\r\n".getBytes(StandardCharsets.UTF_8));
-            return;
-        }
-        out.write(resp.getBytes(StandardCharsets.UTF_8));
+    private void writeResponse(OutputStream out, String response) throws IOException {
+        out.write(response.getBytes(StandardCharsets.UTF_8));
     }
 
-    private static String error(String msg) {
-        return "-ERR " + msg + "\r\n";
+    private String error(String message) {
+        return "-ERR " + message + "\r\n";
     }
 
-    // ──────────────────────────────────────────────────────────────
-    // Protocol error type (recoverable)
-    // ──────────────────────────────────────────────────────────────
+    private void log(String msg) {
+        System.out.println("[ClientHandler] " + msg);
+    }
 
-    private static final class ProtocolException extends IOException {
-        ProtocolException(String message) {
+    public static final class ProtocolException extends IOException {
+        public ProtocolException(String message) {
             super(message);
         }
-    }
-
-    private static void log(String msg) {
-        System.out.println("[miniredis] " + msg);
     }
 }

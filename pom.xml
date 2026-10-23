@@ -15,7 +15,6 @@
     <description>A production-style personal Redis implementation in Java</description>
 
     <properties>
-        <!-- Use 21 for max compatibility. Change to 25/27 if your JDK supports it. -->
         <maven.compiler.release>21</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
@@ -26,6 +25,8 @@
         <mockito.version>5.15.2</mockito.version>
         <slf4j.version>2.0.16</slf4j.version>
         <logback.version>1.5.16</logback.version>
+        <sqlite.version>3.47.1.0</sqlite.version>
+        <jackson.version>2.18.2</jackson.version>
 
         <!-- Plugin versions -->
         <compiler.plugin.version>3.13.0</compiler.plugin.version>
@@ -38,7 +39,26 @@
     </properties>
 
     <dependencies>
-        <!-- ─── Logging (future: replace System.out) ─── -->
+        <!-- ─── Persistence & Relational Metadata ─── -->
+        <dependency>
+            <groupId>org.xerial</groupId>
+            <artifactId>sqlite-jdbc</artifactId>
+            <version>${sqlite.version}</version>
+        </dependency>
+
+        <!-- ─── JSON Processing ─── -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+            <version>${jackson.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>com.fasterxml.jackson.datatype</groupId>
+            <artifactId>jackson-datatype-jsr310</artifactId>
+            <version>${jackson.version}</version>
+        </dependency>
+
+        <!-- ─── Logging ─── -->
         <dependency>
             <groupId>org.slf4j</groupId>
             <artifactId>slf4j-api</artifactId>
@@ -100,7 +120,7 @@
                 </configuration>
             </plugin>
 
-            <!-- Integration tests (future: *IT.java) -->
+            <!-- Integration tests -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-failsafe-plugin</artifactId>
@@ -164,7 +184,7 @@
                 </configuration>
             </plugin>
 
-            <!-- Optional: check for dependency updates → mvn versions:display-dependency-updates -->
+            <!-- Optional: check for dependency updates -->
             <plugin>
                 <groupId>org.codehaus.mojo</groupId>
                 <artifactId>versions-maven-plugin</artifactId>

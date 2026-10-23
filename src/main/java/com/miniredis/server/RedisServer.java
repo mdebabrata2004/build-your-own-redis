@@ -1,6 +1,9 @@
 package com.miniredis.server;
 
 import com.miniredis.command.CommandHandler;
+import com.miniredis.security.ApiKeyService;
+import com.miniredis.storage.EmbeddedStorageEngine;
+import com.miniredis.storage.StorageEngine;
 import com.miniredis.store.DataStore;
 
 import java.io.IOException;
@@ -13,19 +16,12 @@ import java.util.Objects;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Hardened Mini Redis TCP server.
- *
- * - maxClients enforcement
- * - configurable bind address
- * - TCP keepalive
- * - reject when saturated
- * - graceful shutdown
+ * Hardened Mini Redis TCP server with multi-tenant AUTH routing.
  */
 public final class RedisServer implements AutoCloseable {
 
@@ -97,6 +93,9 @@ public final class RedisServer implements AutoCloseable {
 
     private final Config config;
     private final DataStore store;
+    private final StorageEngine storageEngine;
+    private final ApiKeyService apiKeyService;
+    private final boolean requireAuth;
     private final CommandHandler handler;
     private final ExecutorService executor;
 
@@ -122,9 +121,21 @@ public final class RedisServer implements AutoCloseable {
     }
 
     public RedisServer(Config config) {
+        this(config, null, null, false);
+    }
+
+    public RedisServer(Config config, StorageEngine storageEngine, ApiKeyService apiKeyService, boolean requireAuth) {
         this.config = Objects.requireNonNull(config);
-        this.store = new DataStore(config.storeConfig);
-        this.handler = new CommandHandler(store);
+        if (storageEngine != null) {
+            this.storageEngine = storageEngine;
+            this.store = (storageEngine instanceof EmbeddedStorageEngine ese) ? ese.getRawStore() : null;
+        } else {
+            this.store = new DataStore(config.storeConfig);
+            this.storageEngine = new EmbeddedStorageEngine(this.store);
+        }
+        this.apiKeyService = apiKeyService;
+        this.requireAuth = requireAuth;
+        this.handler = new CommandHandler(this.storageEngine, apiKeyService);
 
         this.executor = Executors.newFixedThreadPool(
                 config.threadPoolSize,
@@ -155,16 +166,16 @@ public final class RedisServer implements AutoCloseable {
         try {
             serverSocket = new ServerSocket();
             serverSocket.setReuseAddress(true);
-            serverSocket.setPerformancePreferences(0, 1, 2); // latency over bandwidth
+            serverSocket.setPerformancePreferences(0, 1, 2);
 
             InetAddress addr = InetAddress.getByName(config.bind);
             serverSocket.bind(new InetSocketAddress(addr, config.port), config.backlog);
 
-            log("Mini Redis started");
+            log("Mini Redis TCP Server started");
             log("  bind     : " + config.bind + ":" + config.port);
             log("  threads  : " + config.threadPoolSize);
             log("  maxClients: " + (config.maxClients == 0 ? "unlimited" : config.maxClients));
-            log("  backlog  : " + config.backlog);
+            log("  requireAuth: " + requireAuth);
 
             acceptLoop();
 
@@ -186,7 +197,6 @@ public final class RedisServer implements AutoCloseable {
                 if (running.get()) {
                     log("Accept error: " + e.getMessage());
                 }
-                // else: expected during shutdown
             } catch (IOException e) {
                 if (running.get()) {
                     log("I/O accept error: " + e.getMessage());
@@ -197,7 +207,6 @@ public final class RedisServer implements AutoCloseable {
 
     private void onAccept(Socket client) {
         try {
-            // Enforce max clients
             if (config.maxClients > 0 && activeConnections.get() >= config.maxClients) {
                 rejectedConnections.incrementAndGet();
                 log("Rejected connection (maxClients=" + config.maxClients + "): "
@@ -223,14 +232,13 @@ public final class RedisServer implements AutoCloseable {
             try {
                 executor.submit(() -> {
                     try {
-                        new ClientHandler(client, handler).run();
+                        new ClientHandler(client, storageEngine, apiKeyService, requireAuth).run();
                     } finally {
                         activeConnections.decrementAndGet();
                         closeQuietly(client);
                     }
                 });
             } catch (RejectedExecutionException rex) {
-                // Pool saturated
                 activeConnections.decrementAndGet();
                 rejectedConnections.incrementAndGet();
                 log("Rejected execution (pool full): " + client.getRemoteSocketAddress());
@@ -244,9 +252,6 @@ public final class RedisServer implements AutoCloseable {
         }
     }
 
-    /**
-     * Graceful shutdown: stop accept → drain workers → close store.
-     */
     public void shutdown() {
         if (!running.compareAndSet(true, false)) {
             return;
@@ -254,11 +259,9 @@ public final class RedisServer implements AutoCloseable {
 
         log("Shutting down...");
 
-        // 1. Stop accepting
         closeQuietly(serverSocket);
         serverSocket = null;
 
-        // 2. Drain workers
         executor.shutdown();
         try {
             if (!executor.awaitTermination(15, TimeUnit.SECONDS)) {
@@ -271,11 +274,10 @@ public final class RedisServer implements AutoCloseable {
             Thread.currentThread().interrupt();
         }
 
-        // 3. Persist + close store
         try {
-            store.close();
+            storageEngine.close();
         } catch (Exception e) {
-            log("Error closing DataStore: " + e.getMessage());
+            log("Error closing storage engine: " + e.getMessage());
         }
 
         log("Stopped. total=" + totalConnections.get()
@@ -287,40 +289,18 @@ public final class RedisServer implements AutoCloseable {
         shutdown();
     }
 
-    // ──────────────────────────────────────────────────────────────
-    // Metrics / accessors
-    // ──────────────────────────────────────────────────────────────
-
-    public long getTotalConnections() {
-        return totalConnections.get();
-    }
-
-    public long getActiveConnections() {
-        return activeConnections.get();
-    }
-
-    public long getRejectedConnections() {
-        return rejectedConnections.get();
-    }
-
-    public boolean isRunning() {
-        return running.get();
-    }
-
-    public DataStore getStore() {
-        return store;
-    }
-
-    // ──────────────────────────────────────────────────────────────
-    // Helpers
-    // ──────────────────────────────────────────────────────────────
+    public long getTotalConnections() { return totalConnections.get(); }
+    public long getActiveConnections() { return activeConnections.get(); }
+    public long getRejectedConnections() { return rejectedConnections.get(); }
+    public boolean isRunning() { return running.get(); }
+    public DataStore getStore() { return store; }
+    public StorageEngine getStorageEngine() { return storageEngine; }
 
     private static void closeQuietly(AutoCloseable c) {
         if (c == null) return;
         try {
             c.close();
-        } catch (Exception ignored) {
-        }
+        } catch (Exception ignored) {}
     }
 
     private static void log(String msg) {

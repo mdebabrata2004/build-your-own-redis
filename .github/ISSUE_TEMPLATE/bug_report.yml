@@ -1,0 +1,54 @@
+name: 🐛 Bug Report
+description: Create a report to help us fix a bug in LocalData
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report an issue! Please provide as much detail as possible.
+  - type: input
+    id: version
+    attributes:
+      label: LocalData Version / Commit
+      description: What version of LocalData are you running? (e.g., v1.0.0 or commit hash)
+      placeholder: v1.0.0
+    validations:
+      required: true
+  - type: dropdown
+    id: environment
+    attributes:
+      label: Runtime Environment
+      description: What environment are you running LocalData in?
+      options:
+        - Linux (Ubuntu/Debian)
+        - Linux (RHEL/Rocky/Alpine)
+        - Windows 10/11 / Windows Server
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+        - Docker / Docker Compose
+        - Kubernetes
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: Description of the Bug
+      description: A clear and concise description of what the bug is.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to Reproduce
+      description: |
+        1. Start server with `...`
+        2. Execute request `...`
+        3. See error
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Server Logs / Stack Trace
+      description: Please paste any relevant server logs or error outputs.
+      render: shell
